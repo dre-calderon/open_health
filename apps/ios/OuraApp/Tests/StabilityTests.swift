@@ -51,6 +51,61 @@ final class StabilityTests: XCTestCase {
         XCTAssertNil(Summary(nights: [partial, nap]).stagedSleepDebt())
     }
 
+    func testDaytimeNapNeverBecomesTheDaysNight() {
+        var night = NightRow(ymd: "2026-01-15", start: "01:00", end: "06:00", in_bed_h: 5.0)
+        night.wake_ymd = "2026-01-15"; night.is_nap = false
+        // the nap is shorter than the night here, and still must never be chosen
+        var nap = NightRow(ymd: "2026-01-15", start: "13:00", end: "16:00", in_bed_h: 3.0)
+        nap.wake_ymd = "2026-01-15"; nap.is_nap = true
+        let s = Summary(nights: [nap, night])
+        XCTAssertEqual(s.night(forDay: "2026-01-15")?.start, "01:00")
+        XCTAssertEqual(s.naps(forDay: "2026-01-15").map(\.start), ["13:00"])
+    }
+
+    func testLongNapOutranksAShortNightOnlyWhenTheSummarySaysSo() {
+        // the older behaviour picked by length: a 4 h nap beat a 3.5 h night. The flag
+        // decides now, whatever the durations are.
+        var nap = NightRow(ymd: "2026-01-07", start: "12:00", end: "16:00", in_bed_h: 4.0)
+        nap.wake_ymd = "2026-01-07"; nap.is_nap = true
+        var night = NightRow(ymd: "2026-01-07", start: "01:30", end: "05:00", in_bed_h: 3.5)
+        night.wake_ymd = "2026-01-07"; night.is_nap = false
+        let s = Summary(nights: [nap, night])
+        XCTAssertEqual(s.night(forDay: "2026-01-07")?.start, "01:30")
+    }
+
+    func testADayWithOnlyANapHasNoNightButKeepsTheNap() {
+        var nap = NightRow(ymd: "2026-01-09", start: "12:00", end: "12:40", in_bed_h: 0.7)
+        nap.wake_ymd = "2026-01-09"; nap.is_nap = true
+        let s = Summary(nights: [nap])
+        XCTAssertNil(s.night(forDay: "2026-01-09"))
+        XCTAssertEqual(s.naps(forDay: "2026-01-09").count, 1)
+        // vital trends are night-only: a nap must not become a trend point
+        XCTAssertTrue(s.nightlySeries { $0.rhr }.isEmpty)
+    }
+
+    func testSleepKindKeepsEveryWindowAndRanksOnlyTheMainSleep() {
+        var night = NightRow(ymd: "2026-11-10", start: "23:55", end: "07:30", in_bed_h: 7.6)
+        night.wake_ymd = "2026-11-11"; night.is_nap = false; night.sleep_kind = "main"
+        // a doze before the night: real sleep, outside the daytime window
+        var doze = NightRow(ymd: "2026-11-10", start: "22:10", end: "23:45", in_bed_h: 1.6)
+        doze.wake_ymd = "2026-11-11"; doze.is_nap = false; doze.sleep_kind = "other"
+        // 20 minutes on the sofa with no sleep in it
+        var rest = NightRow(ymd: "2026-11-11", start: "15:00", end: "15:20", in_bed_h: 0.3)
+        rest.wake_ymd = "2026-11-11"; rest.is_nap = false; rest.sleep_kind = "rest"
+        var nap = NightRow(ymd: "2026-11-11", start: "13:00", end: "14:00", in_bed_h: 1.0)
+        nap.wake_ymd = "2026-11-11"; nap.is_nap = true; nap.sleep_kind = "nap"
+        let s = Summary(nights: [rest, nap, doze, night])
+        XCTAssertEqual(s.night(forDay: "2026-11-11")?.start, "23:55")
+        XCTAssertEqual(s.naps(forDay: "2026-11-11").map(\.start), ["13:00"])
+        XCTAssertEqual(Set(s.sideSleep(forDay: "2026-11-11").compactMap(\.start)), ["22:10", "13:00"])
+        XCTAssertEqual(s.rests(forDay: "2026-11-11").map(\.start), ["15:00"])
+        // a summary cached before `sleep_kind` existed still honours `is_nap`
+        var old = NightRow(ymd: "2026-11-12", start: "12:00", end: "13:00", in_bed_h: 1.0)
+        old.wake_ymd = "2026-11-12"; old.is_nap = true
+        XCTAssertTrue(old.isNap)
+        XCTAssertFalse(old.isRest)
+    }
+
     func testNightUsesFullStagesAndExactDurationInsteadOfRoundedPreview() throws {
         let data = Data(#"{"stages":[4,2],"stages_full":[4,1,2,3],"start_unix":100,"end_unix":220,"in_bed_h":0.1}"#.utf8)
         let night = try JSONDecoder().decode(NightRow.self, from: data)

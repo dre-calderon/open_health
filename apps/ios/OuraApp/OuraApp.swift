@@ -85,6 +85,13 @@ struct AllDaysView: View {
     }()
     private static let number: NumberFormatter = { let f = NumberFormatter(); f.numberStyle = .decimal; return f }()
 
+    /// "nap 3.1h" / "2 naps 1.2h" — the day-list shorthand for daytime sleep.
+    private static func napNote(_ naps: [NightRow]) -> String {
+        let total = naps.reduce(0.0) { $0 + ($1.in_bed_h ?? 0) }
+        let label = naps.contains { $0.isOtherSleep } ? "other sleep" : (naps.count == 1 ? "nap" : "\(naps.count) naps")
+        return String(format: "%@ %.1fh", label, total)
+    }
+
     /// Days grouped by month, newest first, keeping the summary's own order.
     private func groups(_ days: [String]) -> [(title: String, days: [String])] {
         var out: [(String, [String])] = []
@@ -126,6 +133,7 @@ struct AllDaysView: View {
     @ViewBuilder private func row(_ s: Summary, _ day: String) -> some View {
         let date = Self.ymd.date(from: day)
         let night = s.night(forDay: day)
+        let naps = s.sideSleep(forDay: day)
         let stat = s.activity_daily[day]
         HStack(spacing: 12) {
             // weekday over day-of-month, a fixed column so the rows line up
@@ -148,11 +156,19 @@ struct AllDaysView: View {
                         Text("·").foregroundStyle(Obs.trace)
                         Text("\(Int(kcal)) kcal").font(Obs.mono(12)).foregroundStyle(Obs.ink2)
                     }
+                    // daytime sleep is named, never swallowed: it is real sleep in the
+                    // day's total and the reason a day can show no night at all
+                    if !naps.isEmpty {
+                        Text("·").foregroundStyle(Obs.trace)
+                        Text(Self.napNote(naps)).font(Obs.mono(12)).foregroundStyle(Obs.ink2)
+                    }
                 }
                 if let n = night, n.hasHypnogram {
                     Hypnogram(stages: n.hypnogram!, height: 12)
                 } else if let n = night, let start = n.start, let end = n.end {
                     Text("\(start) → \(end)").font(Obs.mono(10)).foregroundStyle(Obs.muted)
+                } else if let nap = naps.first(where: { $0.hasHypnogram }) {
+                    Hypnogram(stages: nap.hypnogram!, height: 12).opacity(0.6)
                 }
             }
             Spacer(minLength: 4)

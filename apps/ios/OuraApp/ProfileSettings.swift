@@ -7,6 +7,9 @@ private struct EditableProfile {
     var heightCm: Double
     var weightKg: Double
     var ringSize: Double
+    /// Local clock hours bounding the daytime window (5…22 by default). Fractional.
+    var daytimeStartHour: Double
+    var daytimeEndHour: Double
 
     init(_ profile: Profile?) {
         sex = profile?.sex ?? "M"
@@ -14,6 +17,22 @@ private struct EditableProfile {
         heightCm = (profile?.height_m ?? 1.78) * 100
         weightKg = profile?.weight_kg ?? 75
         ringSize = profile?.ring_size ?? 10
+        daytimeStartHour = profile?.daytime_start_hour ?? 5
+        daytimeEndHour = profile?.daytime_end_hour ?? 22
+    }
+
+    /// A clock hour as a Date today, so the picker can edit it.
+    func date(forHour hour: Double) -> Date {
+        let clamped = min(max(hour, 0), 23.9833)
+        var comps = Calendar.current.dateComponents([.year, .month, .day], from: Date())
+        comps.hour = Int(clamped)
+        comps.minute = Int(((clamped - Double(Int(clamped))) * 60).rounded())
+        return Calendar.current.date(from: comps) ?? Date()
+    }
+
+    static func hour(from date: Date) -> Double {
+        let c = Calendar.current.dateComponents([.hour, .minute], from: date)
+        return Double(c.hour ?? 0) + Double(c.minute ?? 0) / 60
     }
 }
 
@@ -24,6 +43,9 @@ private enum ProfileStore {
         let object: [String: Any] = [
             "sex": p.sex, "age": p.age, "height_m": p.heightCm / 100,
             "weight_kg": p.weightKg, "ring_size": p.ringSize,
+            // the file is rewritten whole, so the daytime window must travel with it
+            "daytime_start_hour": p.daytimeStartHour,
+            "daytime_end_hour": p.daytimeEndHour,
         ]
         let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: url, options: .atomic)
@@ -126,6 +148,21 @@ struct ProfileSettingsView: View {
                     Text("Your data")
                 } footer: {
                     Text("Stored only on this iPhone and used by the cardiovascular and activity calculations.")
+                }
+
+                Section {
+                    DatePicker("Daytime starts", selection: Binding(
+                        get: { profile.date(forHour: profile.daytimeStartHour) },
+                        set: { profile.daytimeStartHour = EditableProfile.hour(from: $0) }),
+                               displayedComponents: .hourAndMinute)
+                    DatePicker("Daytime ends", selection: Binding(
+                        get: { profile.date(forHour: profile.daytimeEndHour) },
+                        set: { profile.daytimeEndHour = EditableProfile.hour(from: $0) }),
+                               displayedComponents: .hourAndMinute)
+                } header: {
+                    Text("Daytime window")
+                } footer: {
+                    Text("Sleep that both starts and ends inside this window is a nap, not your night. Shift workers should move it to their own day — it may wrap midnight (e.g. 19:00 to 09:00).")
                 }
 
                 Section {

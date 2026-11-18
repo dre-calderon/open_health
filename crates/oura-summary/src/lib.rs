@@ -39,12 +39,35 @@ pub struct Demographics {
     pub height_m: f64,
     pub weight_kg: f64,
     pub ring_size: f64,
+    /// Local clock hours bounding the daytime window used to tell a nap from a night.
+    /// Default 05:00–22:00. Shift workers move it to their own waking window.
+    pub daytime_start_hour: f64,
+    pub daytime_end_hour: f64,
+}
+
+/// A clock hour from profile.json: finite, inside 0..24, otherwise the default.
+fn clock_hour(v: Option<&Value>, fallback: f64) -> f64 {
+    v.and_then(Value::as_f64)
+        .filter(|h| h.is_finite() && (0.0..24.0).contains(h))
+        .unwrap_or(fallback)
 }
 
 impl Demographics {
+    /// (start, end) with a non-degenerate window: an equal pair would mean either a
+    /// zero-length or a 24 h daytime window, so it falls back to the default.
+    pub fn daytime_window(self) -> (f64, f64) {
+        let d = Demographics::default();
+        if (self.daytime_end_hour - self.daytime_start_hour).rem_euclid(24.0) > 0.0 {
+            (self.daytime_start_hour, self.daytime_end_hour)
+        } else {
+            (d.daytime_start_hour, d.daytime_end_hour)
+        }
+    }
     pub fn to_json(self) -> Value {
         json!({ "sex": self.sex.to_string(), "age": self.age, "height_m": self.height_m,
-                "weight_kg": self.weight_kg, "ring_size": self.ring_size })
+                "weight_kg": self.weight_kg, "ring_size": self.ring_size,
+                "daytime_start_hour": self.daytime_start_hour,
+                "daytime_end_hour": self.daytime_end_hour })
     }
     pub fn from_json(v: &Value) -> Self {
         let d = Demographics::default();
@@ -58,6 +81,8 @@ impl Demographics {
             height_m: v["height_m"].as_f64().unwrap_or(d.height_m),
             weight_kg: v["weight_kg"].as_f64().unwrap_or(d.weight_kg),
             ring_size: v["ring_size"].as_f64().unwrap_or(d.ring_size),
+            daytime_start_hour: clock_hour(v.get("daytime_start_hour"), d.daytime_start_hour),
+            daytime_end_hour: clock_hour(v.get("daytime_end_hour"), d.daytime_end_hour),
         }
     }
 }
@@ -69,6 +94,8 @@ impl Default for Demographics {
             height_m: 1.78,
             weight_kg: 75.0,
             ring_size: 10.0,
+            daytime_start_hour: 5.0,
+            daytime_end_hour: 22.0,
         }
     }
 }
@@ -489,6 +516,105 @@ fn hm(unix_s: f64, tz: impl Into<OffsetHours>) -> String {
     let sod = (unix_s as i64 + offset_seconds(tz)).rem_euclid(86400);
     format!("{:02}:{:02}", sod / 3600, (sod % 3600) / 60)
 }
+
+/// The daytime window, in local clock hours, that marks a sleep period as a nap rather
+/// than a night: both of its ends must fall inside the window. An overnight sleep
+/// either starts before the window opens or ends after it closes, so it never
+/// qualifies. Duration is deliberately not part of the test: a four-hour afternoon nap
+/// is still a nap, and a short overnight sleep is still a night.
+///
+/// The window is a user setting (profile.json), because a shift worker's day is not
+/// 05:00–22:00. It may wrap midnight (e.g. 20:00–06:00 for night shifts), so both ends
+/// are measured as hours elapsed since the window opened.
+fn is_daytime_sleep(start_unix: f64, end_unix: f64, tz: f64, window: (f64, f64)) -> bool {
+    let (win_start, win_end) = window;
+    let span = (win_end - win_start).rem_euclid(24.0);
+    if !(span > 0.0) {
+        return false;
+    }
+    // local fractional hour of day
+    let local_hour = |u: f64| {
+        let sod = (u as i64 + offset_seconds(tz)).rem_euclid(86_400) as f64;
+        sod / 3_600.0
+    };
+    let since = |h: f64| (h - win_start).rem_euclid(24.0);
+    let (s, e) = (since(local_hour(start_unix)), since(local_hour(end_unix)));
+    let inside = |h: f64| h < span;
+    inside(s) && inside(e) && e >= s
+}
+
+/// One sleep window on a single wake day: (start_ds, end_ds, is_daytime, span_ds).
+type SleepWindow = (i64, i64, bool, i64);
+
+/// The wake day's main sleep, as a (start_ds, end_ds) key.
+///
+/// It is the longest overnight window long enough to count as a night
+/// (`MIN_BASELINE_SLEEP_DS`). A short overnight fragment does not veto the day, so when
+/// there is no such night the longest window is the main sleep instead: someone who
+/// slept 06:00–13:00 slept, they did not nap.
+fn main_sleep_of_day(entries: &[SleepWindow]) -> Option<(i64, i64)> {
+    entries
+        .iter()
+        .filter(|e| !e.2 && e.3 >= sleep_score::MIN_BASELINE_SLEEP_DS)
+        .max_by_key(|e| e.3)
+        .or_else(|| entries.iter().max_by_key(|e| e.3))
+        .map(|e| (e.0, e.1))
+}
+
+/// Shortest time in bed that can be a nap. Below it the ring logged a rest, not a sleep.
+const MIN_NAP_DS: i64 = 15 * 60 * 10;
+
+/// What one sleep window is to its wake day. Exactly one of these per window, so a
+/// client can show every window the ring recorded and never has to guess which is which.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SleepKind {
+    /// The sleep the day is named after.
+    Main,
+    /// Daytime sleep beside the main sleep.
+    Nap,
+    /// Real sleep beside the main sleep that falls outside the daytime window: a doze
+    /// before the night, or a second stretch after getting up at 4 am.
+    Other,
+    /// In bed, but under [`MIN_NAP_DS`] or staged with no sleep in it at all.
+    Rest,
+}
+
+impl SleepKind {
+    fn label(self) -> &'static str {
+        match self {
+            SleepKind::Main => "main",
+            SleepKind::Nap => "nap",
+            SleepKind::Other => "other",
+            SleepKind::Rest => "rest",
+        }
+    }
+}
+
+/// Classify one window. `staged_asleep_s` is the time asleep when the window has a
+/// hypnogram, `None` when it was never staged: an unstaged window cannot be shown to
+/// hold no sleep, so only its length can make it a rest.
+///
+/// A nap has a floor (15 minutes in bed, some sleep in it) and no ceiling. A four-hour
+/// afternoon sleep on a day that already has a night stays a nap, where the official
+/// app would promote anything over three hours to a main sleep; ranking it against the
+/// night is exactly the mistake this classification exists to prevent.
+fn sleep_kind(
+    is_main: bool,
+    is_daytime: bool,
+    span_ds: i64,
+    staged_asleep_s: Option<i32>,
+) -> SleepKind {
+    if is_main {
+        SleepKind::Main
+    } else if span_ds < MIN_NAP_DS || staged_asleep_s == Some(0) {
+        SleepKind::Rest
+    } else if is_daytime {
+        SleepKind::Nap
+    } else {
+        SleepKind::Other
+    }
+}
+
 /// Oura "SpO2 Simple" calibration → percent, clamped to the 85–100 display range.
 /// The quadratic itself is ecore's `spo2_simple_calculate` (see `oura_analysis`);
 /// these are the gen4/oreo coefficients (`a + b·r + c·r²`).
@@ -2467,6 +2593,34 @@ pub fn build_summary(
     };
 
     let mut nights_json = Vec::new();
+    // Which periods are naps, keyed by (start_ds, end_ds). Decided per wake day so the
+    // answer does not depend on evaluation order. The daytime window is a user setting
+    // (profile.json) so a shift worker's sleep is measured against their own day.
+    let daytime = demo.daytime_window();
+    type Keys = std::collections::HashSet<(i64, i64)>;
+    let (main_keys, daytime_keys): (Keys, Keys) = {
+        let mut per_day: std::collections::BTreeMap<i64, Vec<SleepWindow>> = Default::default();
+        for nt in &nights {
+            let start_unix = unix_s_at(nt.start_ds, nt.captured_unix);
+            let end_unix = unix_s_at(nt.end_ds, nt.captured_unix);
+            let wake_day = (end_unix as i64 + offset_seconds(tz)).div_euclid(86_400);
+            per_day.entry(wake_day).or_default().push((
+                nt.start_ds,
+                nt.end_ds,
+                is_daytime_sleep(start_unix, end_unix, tz, daytime),
+                nt.end_ds - nt.start_ds,
+            ));
+        }
+        (
+            per_day.values().filter_map(|day| main_sleep_of_day(day)).collect(),
+            per_day
+                .values()
+                .flatten()
+                .filter(|e| e.2)
+                .map(|e| (e.0, e.1))
+                .collect(),
+        )
+    };
     let mut asleep_by_day: std::collections::BTreeMap<i64, i32> = Default::default();
     let mut incomplete_sleep_days = std::collections::BTreeSet::new();
     // (wake date, biomarkers) per night, oldest first — the Symptom Radar input.
@@ -2574,7 +2728,18 @@ pub fn build_summary(
         let night_rhr = raw_lowest_hr.map(|x| x.round());
         let night_hrv = raw_mean_hrv.map(|x| x.round());
         let night_breath = median_of(&nt.breath);
-        let is_main_sleep = (nt.end_ds - nt.start_ds) >= sleep_score::MIN_BASELINE_SLEEP_DS;
+        let key = (nt.start_ds, nt.end_ds);
+        let kind = sleep_kind(
+            main_keys.contains(&key),
+            daytime_keys.contains(&key),
+            nt.end_ds - nt.start_ds,
+            // only a window with real stage codes can be shown to hold no sleep
+            (valid_stage_count > 0).then_some(asleep_s),
+        );
+        let is_nap = kind == SleepKind::Nap;
+        // Baselines come from nights: never from a nap, and never from a rest.
+        let is_main_sleep = matches!(kind, SleepKind::Main | SleepKind::Other)
+            && (nt.end_ds - nt.start_ds) >= sleep_score::MIN_BASELINE_SLEEP_DS;
         let rhr_baseline = if is_main_sleep {
             let priors: Vec<f64> = prior_main_rhr
                 .iter()
@@ -2609,6 +2774,9 @@ pub fn build_summary(
             // The morning you woke up: what the apps group a night under. Computed
             // here so the clients never have to guess it from the clock strings.
             "wake_ymd": ymd_label(end_unix, tz),
+            // Daytime sleep (a nap). The clients must not rank a nap against a night
+            // when picking "the sleep you woke from" for a day.
+            "is_nap": is_nap,
             "start_unix": start_unix.round() as i64,
             "end_unix": end_unix.round() as i64,
             "clock_source": clock.resolve(nt.end_ds, nt.captured_unix).source.label(),
@@ -2683,6 +2851,9 @@ pub fn build_summary(
             }) } else { Value::Null },
             "breath_rate": night_breath.map(|b| (b * 10.0).round() / 10.0),
         });
+        // main | nap | other | rest: every window gets exactly one, so the clients can
+        // show all of them. `is_nap` stays for clients that only know the flag.
+        night_json["sleep_kind"] = json!(kind.label());
         night_json["stages_5min"] = json!(stages_5min);
         night_json["stages_t0_unix"] = json!(stages_t0_unix);
         nights_json.push(night_json);
@@ -3201,6 +3372,119 @@ mod tests {
         // A single-sample packet (or a beat event with step 0) sits on the stamp.
         assert_eq!(packed_sample_ds(packet_ds, 0, 1, step_ds), packet_ds);
         assert_eq!(packed_sample_ds(packet_ds, 0, 1, 0), packet_ds);
+    }
+
+    #[test]
+    fn the_overnight_sleep_is_the_main_sleep_and_the_afternoon_is_a_nap() {
+        // hours → deciseconds
+        let ds = |h: i64| h * 36_000;
+        // a 5 h overnight sleep plus a 4 h afternoon nap
+        let day = vec![(ds(3), ds(8), false, ds(5)), (ds(11), ds(15), true, ds(4))];
+        assert_eq!(main_sleep_of_day(&day), Some((ds(3), ds(8))));
+        assert_eq!(sleep_kind(false, true, ds(4), Some(12_000)), SleepKind::Nap);
+    }
+
+    #[test]
+    fn a_short_overnight_fragment_does_not_veto_the_day() {
+        let ds = |h: i64| h * 36_000;
+        // a short overnight fragment + a long daytime period + a 3 h daytime period:
+        // no real night here, so the longest period is the main sleep, the other
+        // daytime period is a nap, and the overnight fragment is kept as other sleep.
+        let day = vec![
+            (ds(23), ds(26), false, ds(1)),
+            (ds(10), ds(20), true, ds(9)),
+            (ds(5), ds(8), true, ds(3)),
+        ];
+        assert_eq!(main_sleep_of_day(&day), Some((ds(10), ds(20))));
+        assert_eq!(sleep_kind(false, true, ds(3), Some(9_000)), SleepKind::Nap);
+        assert_eq!(sleep_kind(false, false, ds(1), Some(3_000)), SleepKind::Other);
+    }
+
+    #[test]
+    fn a_late_sleeper_is_asleep_not_napping() {
+        let ds = |h: i64| h * 36_000;
+        // nobody else slept that day: 06:00–13:00 is the main sleep, not a nap
+        let day = [(ds(6), ds(13), true, ds(7))];
+        assert_eq!(main_sleep_of_day(&day), Some((ds(6), ds(13))));
+        assert_eq!(sleep_kind(true, true, ds(7), Some(20_000)), SleepKind::Main);
+    }
+
+    #[test]
+    fn a_nap_has_a_floor_and_no_ceiling() {
+        let min = |m: i64| m * 600;
+        // 14 minutes in bed is a rest whatever the stager says; 15 is a nap.
+        assert_eq!(sleep_kind(false, true, min(14), Some(600)), SleepKind::Rest);
+        assert_eq!(sleep_kind(false, true, min(15), Some(600)), SleepKind::Nap);
+        // Staged, and not one epoch of sleep in it: a rest, however long.
+        assert_eq!(sleep_kind(false, true, min(50), Some(0)), SleepKind::Rest);
+        // Never staged (no model): only the length can rule it out.
+        assert_eq!(sleep_kind(false, true, min(50), None), SleepKind::Nap);
+        // Four hours in the afternoon beside a real night is still a nap. The official
+        // app promotes anything over three hours to a main sleep; this does not.
+        assert_eq!(sleep_kind(false, true, min(240), Some(12_000)), SleepKind::Nap);
+    }
+
+    #[test]
+    fn sleep_outside_the_daytime_window_is_kept_not_dropped() {
+        let min = |m: i64| m * 600;
+        // A 23:00 doze before the night, or a second stretch after a 4 am wake: not
+        // daytime, so not a nap, and not the main sleep. It is still sleep.
+        assert_eq!(sleep_kind(false, false, min(95), Some(3_900)), SleepKind::Other);
+        // The same window with no sleep in it is a rest.
+        assert_eq!(sleep_kind(false, false, min(95), Some(0)), SleepKind::Rest);
+        // The main sleep is the main sleep, short or long, staged or not.
+        assert_eq!(sleep_kind(true, false, min(10), None), SleepKind::Main);
+        assert_eq!(sleep_kind(true, true, min(420), Some(0)), SleepKind::Main);
+        // One main sleep per day: the 5.5 h night, not the 4.1 h afternoon.
+        let ds = |h: i64| h * 36_000;
+        let day = vec![(ds(3), ds(8), false, ds(5)), (ds(11), ds(15), true, ds(4))];
+        assert_eq!(main_sleep_of_day(&day), Some((ds(3), ds(8))));
+    }
+
+    #[test]
+    fn daytime_sleep_is_a_nap_and_overnight_sleep_is_not() {
+        // tz = -8 (PST); `at(h)` is that local clock hour on 1970-01-01
+        let tz = -8.0;
+        let at = |h: i64| ((h + 8) * 3600) as f64;
+        let day = (5.0, 22.0);
+        // 12:00–16:00, and an afternoon nap that runs long
+        assert!(is_daytime_sleep(at(12), at(16), tz, day));
+        assert!(is_daytime_sleep(at(14), at(20), tz, day));
+        // a night that ends in the morning starts before 05:00 local
+        assert!(!is_daytime_sleep(at(3), at(8), tz, day));
+        // a night that starts at 23:00 ends after 22:00 local
+        assert!(!is_daytime_sleep(at(23), at(30), tz, day));
+    }
+
+    #[test]
+    fn a_shift_workers_window_moves_the_nap_boundary() {
+        let tz = -8.0;
+        let at = |h: i64| ((h + 8) * 3600) as f64;
+        // A night-shift sleeper: awake 19:00–09:00, in bed 09:00–17:00. Against the
+        // default 05:00–22:00 their main sleep would read as a nap.
+        let day = (5.0, 22.0);
+        assert!(is_daytime_sleep(at(9), at(17), tz, day));
+        // With their own window (19:00 → 09:00, wrapping midnight) it is a night, and
+        // an evening doze before the shift is the nap instead.
+        let shifted = (19.0, 9.0);
+        assert!(!is_daytime_sleep(at(9), at(17), tz, shifted));
+        assert!(is_daytime_sleep(at(21), at(23), tz, shifted));
+        // A wrapped window still rejects sleep that straddles its opening edge.
+        assert!(!is_daytime_sleep(at(18), at(20), tz, shifted));
+    }
+
+    #[test]
+    fn a_degenerate_daytime_window_falls_back_to_the_default() {
+        let mut p = Demographics::default();
+        p.daytime_start_hour = 6.0;
+        p.daytime_end_hour = 6.0; // zero length: not a usable setting
+        assert_eq!(p.daytime_window(), (5.0, 22.0));
+        p.daytime_end_hour = 23.5;
+        assert_eq!(p.daytime_window(), (6.0, 23.5));
+        // out-of-range hours in profile.json are ignored instead of trusted
+        let v = json!({ "daytime_start_hour": 31.0, "daytime_end_hour": -2.0 });
+        let d = Demographics::from_json(&v);
+        assert_eq!((d.daytime_start_hour, d.daytime_end_hour), (5.0, 22.0));
     }
 
     #[test]

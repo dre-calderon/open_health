@@ -162,6 +162,11 @@
         <div class="field"><label for="f-height">Height (m)</label><input id="f-height" name="height_m" type="number" min="1" max="2.3" step="0.01" /></div>
         <div class="field"><label for="f-weight">Weight (kg)</label><input id="f-weight" name="weight_kg" type="number" min="20" max="250" step="1" /></div>
       </div>
+      <div class="field-row">
+        <div class="field"><label for="f-day-start">Daytime starts</label><input id="f-day-start" name="daytime_start_hour" type="time" step="900" /></div>
+        <div class="field"><label for="f-day-end">Daytime ends</label><input id="f-day-end" name="daytime_end_hour" type="time" step="900" /></div>
+      </div>
+      <p class="dialog-sub">Sleep inside this window is a nap, not the night. Move it to your own day if you work shifts (it may wrap midnight).</p>
       <div class="dialog-actions">
         <button type="button" id="profile-cancel" class="btn-text">Cancel</button>
         <button type="submit" id="profile-save" class="btn-primary">Save</button>

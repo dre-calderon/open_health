@@ -36,6 +36,27 @@ const nssa = { ...data, nights: [{ ...night, stages_full: new Array(40).fill(2),
   staging_source: 'nssa', stages_5min: [4, 2, 1, 3], stages_t0_unix: start - 20 }] };
 w.openDayPage(nssa, '2026-09-26');
 const lanes = [...w.document.querySelectorAll('.tl-row')].map(row => row.textContent);
+// Every window the ring recorded is shown as what it is: the main night, a nap, other
+// sleep outside the daytime window, or a rest. None is dropped and none replaces the night.
+const win = (o) => ({ ...night, stages_full: [2, 2, 2, 2], stages: [2, 2], staging_complete: true,
+  metrics: { asleep_min: 60 }, efficiency: 80, deep_pct: 0, light_pct: 100, rem_pct: 0, wake_pct: 0, ...o });
+const kinds = { ...data, nights: [
+  win({ sleep_kind: 'main', is_nap: false, in_bed_h: 8 }),
+  win({ sleep_kind: 'nap', is_nap: true, start: '13:00', end: '14:00', in_bed_h: 1, start_unix: start + 15 * 3600 }),
+  win({ sleep_kind: 'other', is_nap: false, start: '20:30', end: '21:40', in_bed_h: 1.2, start_unix: start - 2 * 3600 }),
+  win({ sleep_kind: 'rest', is_nap: false, start: '15:00', end: '15:12', in_bed_h: 0.2, start_unix: start + 17 * 3600,
+        metrics: {}, stages_full: [4, 4], efficiency: 0 }),
+] };
+w.openDayPage(kinds, '2026-09-26');
+const sleepText = w.document.querySelector('#sec-sleep').textContent;
+assert(sleepText.includes('Other sleep'), 'non-daytime sleep beside the night must be shown');
+assert(sleepText.includes('13:00') && sleepText.includes('20:30'), 'nap and other sleep both listed');
+assert(sleepText.includes('Rest 15:00') && sleepText.includes('no sleep detected'), 'rest is named, not hidden');
+assert.equal(w.document.querySelectorAll('#sec-sleep .nap-item').length, 2, 'a rest is not drawn as sleep');
+// a payload from before `sleep_kind` still honours `is_nap`
+const legacy = { ...data, nights: [win({ in_bed_h: 8 }), win({ is_nap: true, start: '13:00', end: '14:00', in_bed_h: 1 })] };
+w.openDayPage(legacy, '2026-09-26');
+assert.equal(w.document.querySelectorAll('#sec-sleep .nap-item').length, 1);
 assert(lanes.some(t => t.includes('Stages · 5 min (Oura app)')), '5-minute Oura lane missing');
 assert(lanes.some(t => t.includes('Stages') && !t.includes('5 min')), '30 s stage lane missing');
 const absent = { ...data, nights: [{ ...night, start_ds: 10000, end_ds: 298000, stages_full: [] }] };

@@ -50,6 +50,14 @@ struct NightRow: Codable, Identifiable {
     var wake_ymd: String?; var start_unix: Int64?; var end_unix: Int64?; var clock_source: String?
     var in_bed_h: Double?; var hrv_ms: Double?; var rhr: Double?
     var skin_temp: Double?; var spo2_mean: Double?
+    /// True when the summary classified this window as daytime sleep (a nap) rather
+    /// than its day's night. The decision is made once, in the shared brain, against
+    /// the user's daytime window (profile.json) — never re-derived here.
+    var is_nap: Bool? = nil
+    /// What this window is to its wake day: "main", "nap", "other" (real sleep beside
+    /// the night that is not daytime sleep) or "rest" (in bed, no sleep). Nil on
+    /// summaries cached before the field existed; `is_nap` still answers for those.
+    var sleep_kind: String? = nil
     // model-derived (present once the hypnogram runner is wired): per-30s stage codes
     // 1=deep 2=light 3=rem 4=wake, the stage percentages, and efficiency.
     var deep_pct: Double?; var light_pct: Double?; var rem_pct: Double?
@@ -73,6 +81,14 @@ struct NightRow: Codable, Identifiable {
         return Sleep.isOuraStaging(staging_source) ? st : Sleep.smooth(st, 5)
     }
     var stagingComplete: Bool { staging_complete ?? (hypnogram?.allSatisfy { (1...4).contains($0) } ?? false) }
+    /// The summary's nap classification; false for old cached summaries that predate it.
+    var isNap: Bool { sleep_kind.map { $0 == "nap" } ?? (is_nap == true) }
+    /// Real sleep beside the main night, outside the daytime window.
+    var isOtherSleep: Bool { sleep_kind == "other" }
+    /// In bed, but too short or with no sleep in it. Listed, never ranked as sleep.
+    var isRest: Bool { sleep_kind == "rest" }
+    /// Anything that must not compete to be the day's night.
+    var isSideSleep: Bool { isNap || isOtherSleep || isRest }
     var durationS: Double {
         if let start_unix, let end_unix { return Double(end_unix - start_unix) }
         return (in_bed_h ?? 0) * 3600
@@ -159,7 +175,9 @@ enum JSONValue: Codable {
 }
 
 struct DailyStat: Codable { var active_kcal: Double?; var total_kcal: Double?; var steps: Double?; var distance_m: Double? }
-struct Profile: Codable { var sex: String?; var age: Double?; var height_m: Double?; var weight_kg: Double?; var ring_size: Double? }
+struct Profile: Codable { var sex: String?; var age: Double?; var height_m: Double?; var weight_kg: Double?; var ring_size: Double?
+    /// Local clock hours bounding the daytime window that separates a nap from a night.
+    var daytime_start_hour: Double?; var daytime_end_hour: Double? }
 // a detected activity session (on-device automatic_activity_detection)
 struct WorkoutSession: Identifiable, Codable {
     let start: String; let end: String; let durationMin: Int; let label: String; let isWorkout: Double
@@ -385,20 +403,46 @@ extension Summary {
     }
 
     // the primary sleep you woke from on the morning of `day` — the longest in-bed night
-    // wins over same-morning naps. Falls back to a MM-DD match for older data lacking ymd.
+    // wins over same-morning naps, and a window the summary flagged `is_nap` never wins
+    // at all. Falls back to a MM-DD match for older data lacking ymd.
     func night(forDay day: String) -> NightRow? {
-        let cands = nights.filter { wakeYmd($0) == day }
+        let ofDay = nights.filter { wakeYmd($0) == day }
+        if let main = ofDay.first(where: { $0.sleep_kind == "main" }) { return main }
+        let cands = ofDay.filter { !$0.isSideSleep }
         if let best = cands.max(by: { ($0.in_bed_h ?? 0) < ($1.in_bed_h ?? 0) }) { return best }
-        return nights.first { $0.ymd == nil && ($0.date ?? "").hasSuffix(String(day.suffix(5))) }
+        return nights.first { $0.is_nap == nil && $0.ymd == nil && ($0.date ?? "").hasSuffix(String(day.suffix(5))) }
+    }
+
+    /// This day's naps, in the order they happened.
+    func naps(forDay day: String) -> [NightRow] {
+        nights
+            .filter { $0.isNap && wakeYmd($0) == day }
+            .sorted { ($0.start_unix ?? 0) < ($1.start_unix ?? 0) }
+    }
+
+    /// Sleep shown beside the night: naps, and real sleep outside the daytime window
+    /// (a doze before the night, a second stretch after an early wake).
+    func sideSleep(forDay day: String) -> [NightRow] {
+        nights
+            .filter { ($0.isNap || $0.isOtherSleep) && wakeYmd($0) == day }
+            .sorted { ($0.start_unix ?? 0) < ($1.start_unix ?? 0) }
+    }
+
+    /// Time in bed with no sleep in it. Named in the report so it does not read as lost data.
+    func rests(forDay day: String) -> [NightRow] {
+        nights
+            .filter { $0.isRest && wakeYmd($0) == day }
+            .sorted { ($0.start_unix ?? 0) < ($1.start_unix ?? 0) }
     }
     func workoutsOn(_ day: String) -> [WorkoutSession] {
         workouts.filter { $0.isWorkout >= 0.5 && $0.dayLabel == day }
     }
 
     /// One value per wake-date (longest night wins), oldest first — feeds vital trend charts.
+    /// Naps are excluded: a trend point must come from the night, never from a daytime nap.
     func nightlySeries(_ pick: (NightRow) -> Double?) -> [DatedVital] {
         var byDay: [String: (dur: Double, value: Double)] = [:]
-        for night in nights {
+        for night in nights where !night.isSideSleep {
             guard let value = pick(night), value.isFinite else { continue }
             guard let day = wakeYmd(night) ?? night.ymd else { continue }
             let dur = night.in_bed_h ?? 0
@@ -491,14 +535,14 @@ struct WakingActivityTimeline {
 
 extension Summary {
     func wakingActivityTimeline(for day: String, now: Date = Date()) -> WakingActivityTimeline {
-        let recentMainSleeps = Array(nights.filter { ($0.in_bed_h ?? 0) >= 3 }.prefix(14))
+        let recentMainSleeps = Array(nights.filter { !$0.isSideSleep && ($0.in_bed_h ?? 0) >= 3 }.prefix(14))
         let wake = night(forDay: day)?.end.flatMap(clockHour)
             ?? median(recentMainSleeps.compactMap { $0.end.flatMap(clockHour) })
             ?? 6
 
         // Prefer the sleep that actually started after this waking day. On a current
         // day it does not exist yet, so use the recent median main-sleep onset.
-        let sameDaySleeps = nights.filter { $0.ymd == day && ($0.in_bed_h ?? 0) >= 3 }
+        let sameDaySleeps = nights.filter { !$0.isSideSleep && $0.ymd == day && ($0.in_bed_h ?? 0) >= 3 }
         let observedBed = sameDaySleeps.max { ($0.in_bed_h ?? 0) < ($1.in_bed_h ?? 0) }?
             .start.flatMap(clockHour).map { hourAfterWake($0, wake: wake) }
         let estimatedBed = median(recentMainSleeps.compactMap { n -> Double? in

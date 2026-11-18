@@ -375,6 +375,20 @@ body {
   transform: rotate(-45deg); flex: none;
 }
 .day-part:hover .dp-chev { border-color: var(--accent); }
+/* a nap row: informational, so no pointer affordance and slightly recessed */
+.day-part.nap { cursor: default; padding: 10px 0 12px; }
+.day-part.nap:hover { background: none; }
+.day-part.nap .dp-tag { color: var(--faint); }
+.day-part.nap .dp-head { margin-bottom: 7px; }
+.day-part.nap .hyp { opacity: 0.7; }
+/* day page: naps get the night's tiles and stage bar, dimmed, without night framing */
+.nap-block { display: flex; flex-direction: column; gap: 18px; }
+.nap-item { padding: 12px 0 4px; border-top: 1px solid var(--line-soft); }
+.nap-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+.nap-head .dp-tag { color: var(--faint); }
+.nap-hypno { position: relative; display: block; width: 100%; height: 56px; margin-top: 10px; overflow: visible; }
+.nap-item .stagebar { margin-top: 12px; height: 6px; }
+.nap-item .stat-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 /* movement ridge (shared by card + detail) */
 .day-ridge { display: block; width: 100%; height: 40px; margin: 4px 0 2px; overflow: visible; }
 .day-ridge path { fill: color-mix(in oklab, var(--accent) 16%, transparent); stroke: color-mix(in oklab, var(--accent) 55%, transparent); stroke-width: 1; vector-effect: non-scaling-stroke; }
@@ -675,6 +689,7 @@ body.page-open { overflow: hidden; }
 .dl-date { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 540; }
 .dl-sub { font-size: 12px; color: var(--faint); font-family: var(--mono); font-variant-numeric: tabular-nums; margin-top: 2px; }
 .dl-hyp { width: 120px; height: 24px; }
+.dl-hyp.dl-hyp-nap { opacity: 0.55; }
 @media (max-width: 460px) { .dl-hyp { width: 80px; } }
 
 /* ── device & data health ───────────────────────────────── */
@@ -884,6 +899,8 @@ body.page-open { overflow: hidden; }
 .t3p { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 12px; color: var(--faint); text-align: right; }
 .ad-foot { font-size: 11px; color: var(--faint); line-height: 1.4; margin: 0 0 14px; }
 .ad-muted { font-size: 12.5px; color: var(--faint); }
+/* a rest: time in bed with no sleep in it. Named so it is not mistaken for lost data. */
+.rest-line { margin-top: 10px; font-family: var(--mono); }
 
 /* ── advanced / debugging disclosure ────────────────────── */
 .dh-advanced { grid-column: 1 / -1; margin-top: 8px; border-top: 1px solid var(--line-soft); padding-top: 16px; }

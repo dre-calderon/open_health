@@ -1550,6 +1550,36 @@ struct DayReportView: View {
     }
 }
 
+/// One daytime sleep: its own window, its own tiles, its own hypnogram. Naps are real
+/// sleep and are counted in the day's total, so they are drawn without night framing.
+struct NapCard: View {
+    let n: NightRow
+
+    private var asleepH: Double? {
+        guard n.hasHypnogram else { return nil }
+        return Sleep.metrics(n.analysisStages, inBedS: n.durationS).map { $0.asleepMin / 60 }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 0) {
+                Readout(value: n.in_bed_h.map { String(format: "%.1f h", $0) } ?? "–", caption: "in bed")
+                Readout(value: asleepH.map { String(format: "%.1f h", $0) } ?? "–", caption: "asleep")
+                Readout(value: n.efficiency.map { "\(Int($0))%" } ?? "–", caption: "efficiency")
+                Readout(value: "\(n.start ?? "–")–\(n.end ?? "–")", caption: "window")
+            }
+            if n.hasHypnogram {
+                HypnoCanvas(stages: n.analysisStages).frame(height: 56)
+                StageBar(n: n)
+            } else if n.hasSignals {
+                Text("No sleep stages for this nap — signals only.")
+                    .font(Obs.mono(11)).foregroundStyle(Obs.ink2)
+            }
+        }
+        .padding(.vertical, 6)
+    }
+}
+
 struct SleepReport: View {
     let s: Summary
     let day: String
@@ -1642,9 +1672,31 @@ struct SleepReport: View {
                     .font(Obs.mono(12)).foregroundStyle(Obs.ink2).fixedSize(horizontal: false, vertical: true)
             }
         } else {
-            Text("No sleep recorded for this night.").font(Obs.mono(13)).foregroundStyle(Obs.ink2)
+            Text(naps.isEmpty
+                 ? "No sleep recorded for this night."
+                 : "No main sleep this day. Daytime sleep below.")
+                .font(Obs.mono(13)).foregroundStyle(Obs.ink2)
+        }
+
+        // Naps are their own sleep, shown beside the night rather than ranked against
+        // it: a four-hour afternoon nap must never read as last night.
+        if !naps.isEmpty {
+            Rule(naps.contains { $0.isOtherSleep } ? "other sleep" : (naps.count == 1 ? "nap" : "naps"))
+            ForEach(naps) { NapCard(n: $0) }
+            Text("Sleep beside your night. It counts toward the day's sleep total; it is never your night.")
+                .font(Obs.mono(11)).foregroundStyle(Obs.ink2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        // A rest is time in bed with no sleep in it. Named, so it does not read as lost data.
+        ForEach(rests) { rest in
+            Text("Rest \(rest.start ?? "–")–\(rest.end ?? "–") · \(Int(((rest.in_bed_h ?? 0) * 60).rounded())) min in bed, no sleep detected")
+                .font(Obs.mono(11)).foregroundStyle(Obs.muted)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
+
+    private var naps: [NightRow] { s.sideSleep(forDay: day) }
+    private var rests: [NightRow] { s.rests(forDay: day) }
 
     @ViewBuilder private func bedtimeEditor(_ n: NightRow) -> some View {
         let nightKey = n.date ?? day

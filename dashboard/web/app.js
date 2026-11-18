@@ -209,12 +209,57 @@ function dayKeys(d) {
   return [...set].filter(Boolean).sort().reverse();
 }
 
+// Naps are classified by the summary (`is_nap`), which decides per wake day: a daytime
+// period is a nap only when the day also has a longer/overnight sleep. Never guess it
+// from the clock strings here; a payload without the flag simply has no nap rows.
+function isNapNight(n) {
+  return sleepKind(n) === "nap";
+}
+
+// What the summary says a window is to its wake day: "main", "nap", "other" (real sleep
+// beside the night that is not daytime sleep) or "rest" (in bed, no sleep). Older
+// payloads carry only `is_nap`; with neither, a window is just a candidate night.
+function sleepKind(n) {
+  if (!n) return null;
+  if (n.sleep_kind) return n.sleep_kind;
+  return n.is_nap === true ? "nap" : null;
+}
+
 // the primary sleep you woke from on the morning of `ymd` — the longest in-bed night
 // wins over same-morning naps. Falls back to a MM-DD match for older data lacking ymd.
 function nightForDay(d, ymd) {
-  const cands = (d.nights || []).filter((n) => wakeYmd(n) === ymd);
+  const day = (d.nights || []).filter((n) => wakeYmd(n) === ymd);
+  const main = day.find((n) => sleepKind(n) === "main");
+  if (main) return main;
+  const cands = day.filter((n) => sleepKind(n) == null);
   if (cands.length) return cands.reduce((a, b) => ((b.in_bed_h || 0) > (a.in_bed_h || 0) ? b : a));
   return (d.nights || []).find((n) => n.ymd == null && (n.date || "").endsWith(ymd.slice(5))) || null;
+}
+
+// this day's windows of the given kinds, in the order they happened
+function sleepOfKind(d, ymd, kinds) {
+  return (d.nights || [])
+    .filter((n) => wakeYmd(n) === ymd && kinds.includes(sleepKind(n)))
+    .sort((a, b) => (a.start_unix || 0) - (b.start_unix || 0));
+}
+function napsForDay(d, ymd) {
+  return sleepOfKind(d, ymd, ["nap"]);
+}
+// Sleep beside the main night that is shown with it: naps, and real sleep outside the
+// daytime window (a doze before the night, a second stretch after an early wake).
+function sideSleepForDay(d, ymd) {
+  return sleepOfKind(d, ymd, ["nap", "other"]);
+}
+// In bed with no sleep in it, or under 15 minutes. Listed, never drawn as sleep.
+function restsForDay(d, ymd) {
+  return sleepOfKind(d, ymd, ["rest"]);
+}
+function sideTag(n) {
+  return sleepKind(n) === "other" ? "Sleep" : "Nap";
+}
+function restLine(r) {
+  const mins = Math.round((r.in_bed_h || 0) * 60);
+  return `Rest ${esc(r.start || "—")}–${esc(r.end || "—")} · ${mins} min in bed, no sleep detected`;
 }
 
 // this day's sessions, start rewritten to minutes-past-midnight so openActDetail()
@@ -267,6 +312,19 @@ function dayCard(d, ymd) {
     sp.addEventListener("click", () => openDayPage(d, ymd, "sleep"));
     card.append(sp);
   }
+
+  // Naps are shown, not swallowed. The ring records daytime sleep as a real period and
+  // it already counts toward the day's sleep total, so the card names it separately
+  // instead of ranking it against the night. Not clickable: the day page's sleep view
+  // is the main night, and a nap row that opened it would show the wrong hypnogram.
+  sideSleepForDay(d, ymd).forEach((nap) => {
+    const np = el("div", "day-part nap");
+    const asleepH = nap.efficiency != null ? (nap.in_bed_h || 0) * (nap.efficiency / 100) : null;
+    np.append(el("div", "dp-head",
+      `<span class="dp-tag">${sideTag(nap)}</span><span class="dp-meta">${esc(nap.start || "—")}–${esc(nap.end || "—")} · ${num(nap.in_bed_h)}h in bed${asleepH != null ? ` · ${num(asleepH)}h asleep` : ""}</span>`));
+    if (nap.stages && nap.stages.length) np.append(hypnogram(nap.stages));
+    card.append(np);
+  });
 
   const ap = el("button", "day-part");
   ap.type = "button";
@@ -825,7 +883,11 @@ function exportDayJson(d, ymd, axis) {
     timezone: tzName,
     tz_offset: tzOff,
     app_version: "web", profile: d.profile || null,
-    sleep: n ? { night: n, sleep_debt: debt } : null,
+    sleep: {
+      night: n || null, naps: napsForDay(d, ymd),
+      other_sleep: sleepOfKind(d, ymd, ["other"]), rests: restsForDay(d, ymd),
+      sleep_debt: debt,
+    },
     activity: {
       daily: (d.activity_daily || {})[ymd] || null,
       profile_met: (d.activity_profile || {})[ymd] || [],
@@ -968,6 +1030,36 @@ function sleepInterpretation(d, n, m) {
   return wrap;
 }
 
+// Naps on the day page: the same stat tiles and stage bar as the night, plus the
+// hypnogram drawn at its real position on the day's shared axis, so a nap reads as
+// part of the day rather than a second night.
+function napBlock(naps, axis) {
+  const wrap = el("div", "nap-block");
+  const W = 1000;
+  naps.forEach((nap) => {
+    const item = el("div", "nap-item");
+    item.append(el("div", "nap-head",
+      `<span class="dp-tag">${sideTag(nap)}</span><span class="dp-meta">${esc(nap.start || "—")}–${esc(nap.end || "—")}</span>`));
+    const asleepH = nap.metrics && nap.metrics.asleep_min != null
+      ? nap.metrics.asleep_min / 60
+      : nap.efficiency != null ? (nap.in_bed_h || 0) * (nap.efficiency / 100) : null;
+    const strip = el("div", "stat-strip");
+    strip.innerHTML =
+      statTile("Time in bed", num(nap.in_bed_h) + " h") +
+      statTile("Asleep", asleepH != null ? asleepH.toFixed(1) + " h" : "—") +
+      statTile("Efficiency", nap.efficiency != null ? nap.efficiency + "%" : "—");
+    item.append(strip);
+    if (nap.deep_pct != null) item.append(stageBar(nap));
+    if (nap.stages_full && nap.stages_full.length) {
+      // drawn across its own window, not the 24 h axis: a 4 h nap squeezed onto a day
+      // axis is a smear a few pixels wide, which defeats the point of showing it
+      item.append(el("div", "nap-hypno", hypnoSvg(nap.stages_full, W, 56)));
+    }
+    wrap.append(item);
+  });
+  return wrap;
+}
+
 // Sleep: stats, then the overnight lanes on the night's slice of the day axis — shown
 // with or without a hypnogram (stages need Oura's SleepNet model; the signals don't) —
 // then the stage-derived architecture and interpretation when stages exist.
@@ -982,8 +1074,19 @@ function sleepSection(d, ymd, axis, cursor) {
     editToggle.title = "Adjust bedtime and wake-up window for this night";
   }
   sec.append(secHead("Sleep", editToggle));
+  const naps = sideSleepForDay(d, ymd);
+  const rests = restsForDay(d, ymd);
+  const appendNaps = () => {
+    if (naps.length) {
+      const onlyNaps = naps.every(isNapNight);
+      sec.append(el("p", "subhead", !onlyNaps ? "Other sleep" : naps.length === 1 ? "Nap" : "Naps"));
+      sec.append(napBlock(naps, axis));
+    }
+    rests.forEach((r) => sec.append(el("div", "ad-muted rest-line", restLine(r))));
+  };
   if (!n) {
     sec.append(el("div", "ad-muted", "No sleep ended on this day in the ring's data."));
+    appendNaps();
     return sec;
   }
   const m = n.metrics || {}, s = n.series || {};
@@ -1073,6 +1176,7 @@ function sleepSection(d, ymd, axis, cursor) {
     });
     sec.append(editor);
   }
+  appendNaps();
   if (staged && n.staging_complete === false)
     sec.append(el("p", "error", "Incomplete sleep analysis. Gaps mean no data, not awake time; sleep metrics are withheld."));
   if (staged && n.staging_source === "signals") {
@@ -1447,16 +1551,23 @@ function openDaysBrowser(d, days) {
   const list = el("div", "daylist");
   days.forEach((ymd) => {
     const n = nightForDay(d, ymd);
+    const naps = sideSleepForDay(d, ymd);
     const ds = (d.activity_daily || {})[ymd];
     const row = el("button", "daylist-row");
     row.type = "button";
     const left = el("div", "dl-left");
     left.append(el("div", "dl-date", dayTitle(ymd)));
-    left.append(el("div", "dl-sub", ds ? `${kfmt(ds.steps)} steps · ${Math.round(ds.active_kcal)} kcal` : (n ? "sleep only" : "—")));
+    const napNote = naps.length ? `${!naps.every(isNapNight) ? "other sleep" : naps.length === 1 ? "nap" : naps.length + " naps"} ${naps.reduce((a, x) => a + (x.in_bed_h || 0), 0).toFixed(1)}h` : null;
+    const sub = [ds ? `${kfmt(ds.steps)} steps · ${Math.round(ds.active_kcal)} kcal` : (n ? "sleep only" : "—"), napNote]
+      .filter(Boolean)
+      .join(" · ");
+    left.append(el("div", "dl-sub", sub));
     row.append(left);
-    if (n && n.stages && n.stages.length) {
-      const hyp = hypnogram(n.stages);
+    const hypSource = (n && n.stages && n.stages.length) ? n : (naps.find((x) => x.stages && x.stages.length) || null);
+    if (hypSource) {
+      const hyp = hypnogram(hypSource.stages);
       hyp.classList.add("dl-hyp");
+      if (!n) hyp.classList.add("dl-hyp-nap");
       row.append(hyp);
     }
     row.append(el("span", "dp-chev"));
@@ -2022,22 +2133,41 @@ function renderActions(d) {
 }
 
 // ── profile dialog ──────────────────────────────────────────
+// The daytime window is stored as fractional clock hours; the inputs speak HH:MM.
+function hoursToHM(h) {
+  h = Number(h);
+  if (!Number.isFinite(h)) return "";
+  const m = Math.round(Math.max(0, Math.min(23.999, h)) * 60);
+  return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+}
+function hmToHours(s, fallback) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec((s || "").trim());
+  if (!m) return fallback;
+  const h = Number(m[1]) + Number(m[2]) / 60;
+  return Number.isFinite(h) && h >= 0 && h < 24 ? h : fallback;
+}
 function openProfile() {
   const p = CURRENT_PROFILE || {};
   $("f-sex").value = p.sex || "M";
   $("f-age").value = p.age ?? 30;
   $("f-height").value = p.height_m ?? 1.78;
   $("f-weight").value = p.weight_kg ?? 75;
+  $("f-day-start").value = hoursToHM(p.daytime_start_hour ?? 5);
+  $("f-day-end").value = hoursToHM(p.daytime_end_hour ?? 22);
   $("profile-dialog").showModal();
 }
 async function saveProfile(e) {
   e.preventDefault();
+  const prev = CURRENT_PROFILE || {};
   const body = {
     sex: $("f-sex").value,
     age: +$("f-age").value,
     height_m: +$("f-height").value,
     weight_kg: +$("f-weight").value,
-    ring_size: (CURRENT_PROFILE && CURRENT_PROFILE.ring_size) || 10, // not on the ring; kept default
+    ring_size: prev.ring_size || 10, // not on the ring; kept default
+    // must travel on every save: profile.json is rewritten whole from this body
+    daytime_start_hour: hmToHours($("f-day-start").value, prev.daytime_start_hour ?? 5),
+    daytime_end_hour: hmToHours($("f-day-end").value, prev.daytime_end_hour ?? 22),
   };
   $("profile-save").disabled = true;
   try {
